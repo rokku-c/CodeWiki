@@ -320,7 +320,11 @@ class CawBackend(LLMBackend):
             return module_tree
         docs_path = os.path.join(working_dir, f"{module_name}.md")
         if os.path.exists(docs_path):
-            logger.info("✓ Module docs already exists at %s", docs_path)
+            logger.info(
+                "✓ Module docs already exists at %s — skipping regeneration "
+                "(incremental run).",
+                docs_path,
+            )
             return module_tree
 
         custom_instructions = config.get_prompt_addition()

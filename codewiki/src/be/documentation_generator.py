@@ -1,6 +1,7 @@
 import logging
 import os
 import json
+import time
 from typing import Dict, List, Any
 from copy import deepcopy
 import traceback
@@ -185,26 +186,28 @@ class DocumentationGenerator:
         processed_modules = set()
 
         if len(module_tree) > 0:
-            for module_path, module_name in processing_order:
+            total = len(processing_order)
+            for idx, (module_path, module_name) in enumerate(processing_order, 1):
+                module_start = time.monotonic()
                 try:
                     # Reload module tree to get latest hierarchical structure from sub-agent modifications
                     module_tree = file_manager.load_json(module_tree_path)
-                    
+
                     # Get the module info from the tree
                     module_info = module_tree
                     for path_part in module_path:
                         module_info = module_info[path_part]
                         if path_part != module_path[-1]:  # Not the last part
                             module_info = module_info.get("children", {})
-                    
+
                     # Skip if already processed
                     module_key = "/".join(module_path)
                     if module_key in processed_modules:
                         continue
-                    
+
                     # Process the module
                     if self.is_leaf_module(module_info):
-                        logger.info(f"📄 Processing leaf module: {module_key}")
+                        logger.info(f"[{idx}/{total}] 📄 Processing leaf module: {module_key}")
                         final_module_tree = await self.backend.run_module_agent(
                             module_name=module_name,
                             components=components,
@@ -213,13 +216,18 @@ class DocumentationGenerator:
                             working_dir=working_dir,
                         )
                     else:
-                        logger.info(f"📁 Processing parent module: {module_key}")
+                        logger.info(f"[{idx}/{total}] 📁 Processing parent module: {module_key}")
                         final_module_tree = await self.generate_parent_module_docs(
                             module_path, working_dir
                         )
-                    
+
                     processed_modules.add(module_key)
-                    
+                    logger.debug(
+                        "Module %s processed in %.2fs",
+                        module_key,
+                        time.monotonic() - module_start,
+                    )
+
                 except Exception as e:
                     logger.error(f"Failed to process module {module_key}: {str(e)}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
@@ -227,9 +235,11 @@ class DocumentationGenerator:
 
             # Generate repo overview
             logger.info(f"📚 Generating repository overview")
+            overview_start = time.monotonic()
             final_module_tree = await self.generate_parent_module_docs(
                 [], working_dir
             )
+            logger.info("Repository overview generated in %.2fs", time.monotonic() - overview_start)
         else:
             logger.info(f"Processing whole repo because repo can fit in the context window")
             repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
