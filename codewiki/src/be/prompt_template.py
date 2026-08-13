@@ -3,6 +3,10 @@ SYSTEM_PROMPT = """
 You are an AI documentation assistant. Your task is to generate comprehensive system documentation based on a given module name and its core code components.
 </ROLE>
 
+<LANGUAGE>
+Generate ALL documentation content in Simplified Chinese (简体中文). Keep code identifiers, file paths, function/class names, and mermaid diagram labels in their original form.
+</LANGUAGE>
+
 <OBJECTIVES>
 Create documentation that helps developers and maintainers understand:
 1. The module's purpose and core functionality
@@ -50,6 +54,10 @@ LEAF_SYSTEM_PROMPT = """
 You are an AI documentation assistant. Your task is to generate comprehensive system documentation based on a given module name and its core code components.
 </ROLE>
 
+<LANGUAGE>
+Generate ALL documentation content in Simplified Chinese (简体中文). Keep code identifiers, file paths, function/class names, and mermaid diagram labels in their original form.
+</LANGUAGE>
+
 <OBJECTIVES>
 Create a comprehensive documentation that helps developers and maintainers understand:
 1. The module's purpose and core functionality
@@ -79,6 +87,7 @@ Generate documentation following the following requirements:
 
 USER_PROMPT = """
 Generate comprehensive documentation for the {module_name} module using the provided module tree and core components.
+Generate ALL documentation content in Simplified Chinese (简体中文), keeping code identifiers, file paths, function/class names, and mermaid diagram labels in their original form.
 
 <MODULE_TREE>
 {module_tree}
@@ -92,6 +101,7 @@ Generate comprehensive documentation for the {module_name} module using the prov
 
 REPO_OVERVIEW_PROMPT = """
 You are an AI documentation assistant. Your task is to generate a brief overview of the {repo_name} repository.
+Generate ALL documentation content in Simplified Chinese (简体中文), keeping code identifiers, file paths, and mermaid diagram labels in their original form.
 
 The overview should be a brief documentation of the repository, including:
 - The purpose of the repository
@@ -111,6 +121,7 @@ overview_content
 
 MODULE_OVERVIEW_PROMPT = """
 You are an AI documentation assistant. Your task is to generate a brief overview of `{module_name}` module.
+Generate ALL documentation content in Simplified Chinese (简体中文), keeping code identifiers, file paths, and mermaid diagram labels in their original form.
 
 The overview should be a brief documentation of the module, including:
 - The purpose of the module

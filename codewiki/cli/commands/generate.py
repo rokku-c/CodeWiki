@@ -31,6 +31,7 @@ from codewiki.cli.adapters.doc_generator import CLIDocumentationGenerator
 from codewiki.cli.utils.instructions import display_post_generation_instructions
 from codewiki.cli.models.job import GenerationOptions
 from codewiki.cli.models.config import AgentInstructions
+from codewiki.src.config import FIRST_MODULE_TREE_FILENAME, MODULE_TREE_FILENAME
 
 
 def parse_patterns(patterns_str: str) -> List[str]:
@@ -146,6 +147,56 @@ def _detect_changed_files(
         return None
 
 
+def _cached_tree_has_changed_files(
+    output_dir: Path,
+    changed_files: list,
+) -> bool:
+    """
+    Return True when any changed file is NOT already represented in the cached
+    module tree.
+
+    Incremental updates keep the existing module_tree.json / first_module_tree.json
+    and only regenerate the docs of affected modules. That is only correct while
+    the set of source files is unchanged: a *new* file (added since the last
+    run) can't be documented unless we re-cluster. Callers use this to decide
+    whether to discard the cached tree and run full clustering again.
+    """
+    import json
+
+    module_tree_path = output_dir / "module_tree.json"
+    if not module_tree_path.exists():
+        return False
+    try:
+        module_tree = json.loads(module_tree_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    known_files = set()
+
+    def _collect(tree):
+        for mod_info in tree.values():
+            for comp in mod_info.get("components", []):
+                rel_path, _, _ = comp.partition("::")
+                if rel_path:
+                    known_files.add(rel_path)
+                else:
+                    known_files.add(comp)
+            children = mod_info.get("children", {})
+            if isinstance(children, dict):
+                _collect(children)
+
+    _collect(module_tree)
+
+    # Also account for module "path" entries, which may name a directory or file.
+    for mod_info in module_tree.values():
+        path = mod_info.get("path")
+        if path:
+            known_files.add(path.rstrip("/"))
+
+    new_files = [f for f in changed_files if f not in known_files]
+    return bool(new_files)
+
+
 def _invalidate_affected_modules(
     output_dir: Path,
     changed_files: List[str],
@@ -157,6 +208,11 @@ def _invalidate_affected_modules(
 
     Reads module_tree.json to find which modules contain changed files,
     then deletes their .md files so they get regenerated.
+
+    Component IDs have the form ``<relative_path>::<name>`` — the file path is
+    matched exactly against the changed file list (not substring), so a change
+    to ``auth/utils.py`` can't be misattributed to a module whose components
+    live in ``utils.py`` at the repo root.
     """
     import json
 
@@ -172,17 +228,23 @@ def _invalidate_affected_modules(
     changed_set = set(changed_files)
     modules_to_invalidate = set()
 
+    def _component_file(component_id: str) -> str:
+        """Return the relative path portion of a ``<path>::<name>`` component ID."""
+        rel_path, _, _ = component_id.partition("::")
+        return rel_path or component_id
+
     def _find_affected(tree, parent_names=None):
         if parent_names is None:
             parent_names = []
         for mod_name, mod_info in tree.items():
             components = mod_info.get("components", [])
-            # Check if any component path overlaps with changed files
+            # Check if any component's file path is among the changed files
             for comp in components:
-                # Component IDs may be class names, check if they match any changed file path
-                if any(changed_file in comp or comp in changed_file for changed_file in changed_set):
+                comp_file = _component_file(comp)
+                if comp_file in changed_set:
                     modules_to_invalidate.add(mod_name)
-                    # Also invalidate parent modules
+                    # Also invalidate parent modules so parent docs that
+                    # summarize the affected child get regenerated.
                     for parent in parent_names:
                         modules_to_invalidate.add(parent)
                     break
@@ -198,7 +260,7 @@ def _invalidate_affected_modules(
         modules_to_invalidate.add("overview")
 
     # Delete affected module docs
-    for mod_name in modules_to_invalidate:
+    for mod_name in sorted(modules_to_invalidate):
         doc_path = output_dir / f"{mod_name}.md"
         if doc_path.exists():
             doc_path.unlink()
@@ -206,7 +268,27 @@ def _invalidate_affected_modules(
                 logger.debug(f"Invalidated: {doc_path.name}")
 
     if verbose:
-        logger.debug(f"Invalidated {len(modules_to_invalidate)} modules for regeneration.")
+        logger.debug(
+            "Invalidated %d module doc(s) for regeneration: %s",
+            len(modules_to_invalidate),
+            ", ".join(sorted(modules_to_invalidate)) or "(none)",
+        )
+
+    # Count how many module docs were kept (not touched) for the summary.
+    kept = 0
+    for name, info in module_tree.items():
+        if name in modules_to_invalidate:
+            continue
+        if (output_dir / f"{name}.md").exists():
+            kept += 1
+        for child in info.get("children", {}):
+            if (output_dir / f"{child}.md").exists() and child not in modules_to_invalidate:
+                kept += 1
+    if verbose:
+        logger.debug(
+            "%d module doc(s) up to date and will be kept as-is (incremental).",
+            kept,
+        )
 
 
 @click.command(name="generate")
@@ -310,7 +392,8 @@ def _invalidate_affected_modules(
 @click.option(
     "--update",
     is_flag=True,
-    help="Incremental update: only regenerate modules affected by changes since last generation",
+    help="Incremental update: only regenerate modules affected by changes since last generation "
+         "(compares HEAD with the commit recorded in metadata.json).",
 )
 @click.option(
     "--compare-to",
@@ -458,9 +541,32 @@ def generate_command(
                 logger.success("No changes detected since last generation. Documentation is up to date.")
                 sys.exit(EXIT_SUCCESS)
             if changed_files is not None:
-                logger.info(f"  Detected {len(changed_files)} changed files — regenerating affected modules.")
-                # Remove cached module docs for affected files so they get regenerated
-                _invalidate_affected_modules(output_dir, changed_files, logger, verbose)
+                logger.info(f"  Detected {len(changed_files)} changed file(s) — regenerating affected modules.")
+                if verbose:
+                    for f in changed_files[:20]:
+                        logger.debug(f"    changed: {f}")
+                    if len(changed_files) > 20:
+                        logger.debug(f"    ... and {len(changed_files) - 20} more")
+
+                # New files (added since the last run) can't be documented from
+                # the cached module tree — drop the cached first tree so the
+                # backend re-runs module clustering and picks them up.
+                if _cached_tree_has_changed_files(output_dir, changed_files):
+                    logger.warning(
+                        "Changed files include new files not in the cached module tree; "
+                        "re-clustering modules (module docs for unchanged files are still reused)."
+                    )
+                    for name in (FIRST_MODULE_TREE_FILENAME, MODULE_TREE_FILENAME):
+                        cached = output_dir / name
+                        if cached.exists():
+                            cached.unlink()
+                            if verbose:
+                                logger.debug(f"Removed cached tree: {cached.name}")
+                else:
+                    # Remove cached module docs for affected files so they get regenerated
+                    _invalidate_affected_modules(output_dir, changed_files, logger, verbose)
+            else:
+                logger.info("  Unable to detect changed files (no metadata); running full generation.")
 
         # Check for existing documentation
         if not update and output_dir.exists() and list(output_dir.glob("*.md")):

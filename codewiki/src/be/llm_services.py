@@ -8,6 +8,7 @@ Supports multiple providers: openai-compatible, anthropic, bedrock, azure-openai
 """
 import inspect
 import logging
+import time
 from typing import Optional
 
 from openai.types import chat
@@ -299,6 +300,72 @@ def _extract_content(response, model: str) -> Optional[str]:
     return content
 
 
+def _log_llm_call(
+    prompt: str,
+    model: str,
+    base_url: str,
+    max_tokens: int,
+    response=None,
+    elapsed: float = 0.0,
+    error: "Exception | None" = None,
+) -> None:
+    """Log a single LLM call with size, timing, and usage detail.
+
+    Kept separate so both the openai-compatible and litellm paths report the
+    same shape. Prompt size is logged in characters and an approximate token
+    count; response usage (prompt/completion tokens) is read from the
+    response object when the provider returns it.
+    """
+    prompt_tokens = None
+    try:
+        from codewiki.src.be.utils import count_tokens
+        prompt_tokens = count_tokens(prompt)
+    except (ImportError, ValueError, OSError) as e:
+        logger.debug("Could not count prompt tokens for %s: %s", model, e)
+
+    if error is not None:
+        logger.error(
+            "LLM call failed after %.2fs — model=%s base_url=%s prompt_chars=%d "
+            "prompt_tokens=%s max_tokens=%d error=%s: %s",
+            elapsed,
+            model,
+            base_url,
+            len(prompt),
+            prompt_tokens,
+            max_tokens,
+            type(error).__name__,
+            error,
+        )
+        return
+
+    usage_str = ""
+    if response is not None:
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            usage_str = (
+                f"prompt={getattr(usage, 'prompt_tokens', '?')} "
+                f"completion={getattr(usage, 'completion_tokens', '?')} "
+                f"total={getattr(usage, 'total_tokens', '?')}"
+            )
+        choices = getattr(response, "choices", None)
+        if choices:
+            finish = getattr(choices[0], "finish_reason", None)
+            if finish:
+                usage_str = (usage_str + f" finish_reason={finish}").strip()
+
+    logger.info(
+        "LLM call OK in %.2fs — model=%s base_url=%s prompt_chars=%d "
+        "prompt_tokens=%s max_tokens=%d usage=%s",
+        elapsed,
+        model,
+        base_url,
+        len(prompt),
+        prompt_tokens,
+        max_tokens,
+        usage_str or "(not reported)",
+    )
+
+
 def call_llm(
     prompt: str,
     config: Config,
@@ -347,11 +414,17 @@ def call_llm(
         "messages": [{"role": "user", "content": prompt}],
     }
 
+    start_time = time.monotonic()
     try:
         response = client.chat.completions.create(
             **base_kwargs,
             **{primary_key: config.max_tokens},
         )
+        _log_llm_call(
+            prompt, model, config.llm_base_url, config.max_tokens,
+            response=response, elapsed=time.monotonic() - start_time,
+        )
+        return _extract_content(response, model)
     except BadRequestError as e:
         if _is_unsupported_token_param_error(e, primary_key):
             logger.info(
@@ -362,9 +435,16 @@ def call_llm(
                 **base_kwargs,
                 **{fallback_key: config.max_tokens},
             )
-        else:
-            raise
-    return _extract_content(response, model)
+            _log_llm_call(
+                prompt, model, config.llm_base_url, config.max_tokens,
+                response=response, elapsed=time.monotonic() - start_time,
+            )
+            return _extract_content(response, model)
+        _log_llm_call(
+            prompt, model, config.llm_base_url, config.max_tokens,
+            elapsed=time.monotonic() - start_time, error=e,
+        )
+        raise
 
 
 def _is_unsupported_token_param_error(err: BadRequestError, param: str) -> bool:
@@ -395,18 +475,51 @@ def _call_llm_via_litellm(
 
     litellm_model = _get_litellm_model_name(model, config.provider)
 
+    completion_kwargs: dict = {
+        "model": litellm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": config.max_tokens,
+    }
+
     if config.provider == "bedrock":
         os.environ.setdefault("AWS_DEFAULT_REGION", config.aws_region)
         os.environ.setdefault("AWS_REGION_NAME", config.aws_region)
         logger.debug("Calling Bedrock model %s in region %s", litellm_model, config.aws_region)
-    elif config.provider == "anthropic":
-        logger.debug("Calling Anthropic model %s via litellm", litellm_model)
+    else:
+        # Anthropic / OpenAI-compatible gateways reached through litellm.
+        # Forward the configured base URL, otherwise litellm silently routes
+        # ``anthropic/<model>`` to api.anthropic.com and the gateway API key is
+        # rejected with 401 invalid x-api-key.
+        completion_kwargs["api_key"] = config.llm_api_key
+        if config.llm_base_url:
+            completion_kwargs["api_base"] = config.llm_base_url
+        logger.debug(
+            "Calling %s via litellm (model=%s, base_url=%s)",
+            config.provider,
+            litellm_model,
+            config.llm_base_url,
+        )
 
-    response = litellm.completion(
-        model=litellm_model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=config.max_tokens,
-        api_key=config.llm_api_key if config.provider != "bedrock" else None,
+    start_time = time.monotonic()
+    try:
+        response = litellm.completion(**completion_kwargs)
+    except Exception as e:
+        _log_llm_call(
+            prompt,
+            litellm_model,
+            config.llm_base_url,
+            config.max_tokens,
+            elapsed=time.monotonic() - start_time,
+            error=e,
+        )
+        raise
+    _log_llm_call(
+        prompt,
+        litellm_model,
+        config.llm_base_url,
+        config.max_tokens,
+        response=response,
+        elapsed=time.monotonic() - start_time,
     )
     return _extract_content(response, litellm_model)
 
